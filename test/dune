@@ -1,0 +1,26 @@
+(executables
+ (names test_spsc_smoke test_spsc_stress test_mpsc_stress test_mpmc_stress)
+ (modules test_spsc_smoke test_spsc_stress test_mpsc_stress test_mpmc_stress)
+ (libraries disruptor unix))
+
+(executable
+ (name test_stm)
+ (modules test_stm)
+ (libraries
+   disruptor
+   qcheck-stm.stm
+   qcheck-stm.sequential
+   qcheck-stm.domain
+   qcheck-lin.domain
+   qcheck-lin.lin))
+
+(executable
+ (name test_comparison)
+ (modules test_comparison)
+ (libraries
+   disruptor
+   qcheck-stm.stm
+   qcheck-stm.sequential
+   qcheck-stm.domain
+   qcheck-lin.domain
+   qcheck-lin.lin))

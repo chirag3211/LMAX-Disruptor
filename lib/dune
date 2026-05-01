@@ -1,0 +1,21 @@
+(library
+ (name disruptor)
+ (wrapped false)
+ (modules
+   ; ── Infrastructure ────────────────────────────────────────────────────
+   sequence
+   ring_buffer
+   wait_strategy
+   sequence_barrier
+   event_processor
+   ; ── Disruptor pipeline internals ──────────────────────────────────────
+   disruptor_sequencer_spsc
+   disruptor_sequencer_mpsc
+   disruptor_pipeline          ; Disruptor.Int_spsc / Int_mpsc / Event_spsc
+   ; ── Spec-correct standalone queues (Tasks 1–3) ────────────────────────
+   queue_spsc                  ; Task 1: Lamport SPSC, two atomic indices
+   queue_mpsc                  ; Task 3: MPSC, CAS on tail
+   queue_mpmc                  ; Task 2: Vyukov MPMC, per-slot sequences
+   ; ── Comparison baselines ──────────────────────────────────────────────
+   lockfree_queue              ; Michael-Scott lock-free unbounded queue
+   bounded_queue))             ; Mutex + condition variable bounded queue
