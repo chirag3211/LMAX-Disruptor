@@ -7,7 +7,7 @@ Ring-buffer queues in OCaml 5 — from Lamport SPSC to LMAX Disruptor MPSC — w
 ## Video Recording
 
 ```
-https://youtu.be/71tPKnZE--E
+https://youtu.be/s4IAw_9LAtw
 ```
 
 ---
