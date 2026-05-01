@@ -1,0 +1,704 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+\definecolor{codegray}{gray}{0.95}
+\definecolor{codeblue}{rgb}{0.0,0.3,0.6}
+\definecolor{codegreen}{rgb}{0.0,0.5,0.2}
+\definecolor{codepurple}{rgb}{0.4,0.0,0.6}
+
+\lstdefinelanguage{OCaml5}{
+  keywords={let,in,rec,fun,if,then,else,match,with,begin,end,type,mutable,true,false,and,do,done,for,while,val,open,module},
+  keywordstyle=\color{codeblue}\bfseries,
+  comment=[s]{(*}{*)},
+  commentstyle=\color{codegreen}\itshape,
+  stringstyle=\color{codepurple},
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  framesep=4pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\lstset{
+  language=OCaml5,
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  framesep=4pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\title{%
+  \textbf{CS6868 Research Mini-Project} \\[0.3em]
+  \Large Bounded Lock-Free Queues: From SPSC to MPMC%
+}
+\author{%
+  Nishan Arya \\ \texttt{da25m0012@smail.iitm.ac.in}
+  \and
+  Chirag \\ \texttt{da25m008@smail.iitm.ac.in}
+  \and
+  Dikshank Sihag \\ \texttt{da25m009@smail.iitm.ac.in}
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Lock-free bounded queues are foundational components in high-performance concurrent systems,
+offering an alternative to allocation-heavy linked-list queues by operating on pre-allocated
+ring buffers. This project systematically implements and evaluates three bounded queue variants
+in OCaml 5---Single-Producer/Single-Consumer (SPSC), Multi-Producer/Single-Consumer (MPSC), and
+Multi-Producer/Multi-Consumer (MPMC)---alongside a partial Disruptor-pipeline port.
+We additionally implement the classical Michael-Scott unbounded queue and a mutex-protected
+bounded queue as baselines. All implementations are verified for linearisability using
+QCheck-Lin and QCheck-STM. Benchmarks across 1--8 threads reveal that: (1)~the SPSC queue
+achieves up to 8.72\,M\,ops/sec with a single producer/consumer pair, delivering
+competitive throughput without any CAS; (2)~the Vyukov MPMC queue and the Disruptor MPSC
+pipeline both outperform the Michael-Scott queue in their respective regimes, but each
+degrades sharply under high thread counts; (3)~cache-line padding via \texttt{Atomic.make\_contended}
+provides a decisive improvement in contended configurations, with a 362\% gain observed
+for the Disruptor MPSC at 4\,producers. We answer the central research question: the most
+dramatic complexity-performance inflection occurs at the MPSC$\to$MPMC boundary, where
+the benefit of per-slot sequence numbers is eroded by symmetric contention on both producer
+and consumer cursors.
+\end{abstract}
+
+%==============================================================================
+\section{Goals}
+\label{sec:goals}
+%==============================================================================
+
+The lock-free unbounded queues studied in Lecture~08 (the Michael-Scott queue) allocate
+a fresh heap node for every enqueue operation. This generates continuous pressure on the
+garbage collector and causes cache misses as nodes traverse the allocator's free lists.
+Bounded queues backed by pre-allocated ring buffers are the standard remedy in
+performance-sensitive applications: the allocation is done once at construction time,
+and thereafter every enqueue/dequeue is a pure array index operation.
+
+The design space of bounded ring-buffer queues spans several points of increasing complexity:
+\begin{itemize}[noitemsep]
+  \item \textbf{SPSC} (single-producer, single-consumer): two monotonically increasing atomic indices; no CAS ever needed.
+  \item \textbf{MPSC} (multi-producer, single-consumer): producers race on the tail via CAS; consumer reads head uncontested.
+  \item \textbf{MPMC} (multi-producer, multi-consumer): per-slot atomic sequence numbers; both ends use CAS or fetch-and-add (FAA).
+\end{itemize}
+The LMAX Disruptor~\cite{disruptor} popularised ring-buffer queues in financial trading
+and introduced the FAA-based multi-producer sequencer with an available-buffer bitmap to
+enable out-of-order publication. This project builds all three variants in OCaml~5,
+tests them exhaustively, and benchmarks them against each other and against classical alternatives.
+
+\paragraph{Research question.}
+\emph{How much throughput does a pre-allocated ring buffer gain over the
+allocation-heavy Michael-Scott queue across different producer/consumer configurations,
+and where in the SPSC $\to$ MPSC $\to$ MPMC design space does the complexity-performance
+trade-off shift most dramatically?}
+
+%==============================================================================
+\section{Background}
+\label{sec:background}
+%==============================================================================
+
+\subsection{Ring buffers and monotonic indices}
+
+A bounded queue of capacity $C$ (a power of two) is backed by an array \texttt{buf[0..C-1]}.
+Two monotonically increasing integers \texttt{head} and \texttt{tail} act as logical indices:
+the slot in use at position $p$ is \texttt{buf[p \& (C-1)]}. Letting indices grow without
+wrapping avoids the classic ABA ambiguity between \emph{full} ($\texttt{tail}-\texttt{head}=C$)
+and \emph{empty} ($\texttt{tail}=\texttt{head}$).
+
+\subsection{SPSC: Lamport's queue~\cite{lamport83}}
+
+With exactly one producer and one consumer, no CAS is ever needed. The producer is the
+\emph{sole writer} of \texttt{tail} and the consumer is the sole writer of \texttt{head}.
+Therefore both can use plain atomic loads and stores. An atomic release-store on
+\texttt{tail} after writing the value ensures the value is visible to the consumer
+before the tail increment, maintaining the necessary ordering guarantee without a full
+memory fence.
+
+\subsection{MPMC: Vyukov's per-slot sequence numbers~\cite{vyukov10}}
+
+Each slot $i$ carries its own atomic \texttt{sequence} field, initialised to $i$.
+The lifecycle of a slot at logical position $p$ is:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Free for write}: \texttt{sequence = p}. A producer who observes this and wins a CAS on \texttt{enqueue\_pos} owns the slot.
+  \item \textbf{Written}: producer sets \texttt{sequence = p+1}, signalling consumers.
+  \item \textbf{Free for next cycle}: consumer sets \texttt{sequence = p + C}, signalling the next producer wave.
+\end{enumerate}
+This requires \emph{no global lock and no ABA protection}: the sequence number encodes both the slot's generation and its state.
+
+\subsection{Disruptor pipeline~\cite{disruptor}}
+
+The LMAX Disruptor separates concerns differently. A \emph{sequencer} (SPSC or multi-producer)
+manages a single monotonic cursor. Producers call \texttt{next} to claim a sequence number,
+write to \texttt{buf[seq \& mask]}, then call \texttt{publish}. For multiple producers,
+\texttt{next} uses FAA to claim a batch atomically and then writes a per-slot
+\texttt{available\_buffer} flag so consumers can detect out-of-order gaps.
+Consumers query a \emph{sequence barrier} which scans the available buffer to find the
+highest contiguous sequence. This design is optimised for fan-out pipelines where \emph{every}
+consumer processes every event, rather than work-stealing where each event goes to exactly
+one consumer.
+
+\subsection{Michael-Scott queue~\cite{ms96}}
+
+The classical lock-free unbounded queue uses a linked list of dynamically allocated nodes.
+The enqueue operation CAS-swings the tail pointer; dequeue CAS-advances the head. The
+allocation of one heap node per enqueue is its primary performance liability compared to
+ring-buffer designs.
+
+%==============================================================================
+\section{Tasks Undertaken}
+\label{sec:tasks}
+%==============================================================================
+
+\subsection{SPSC Queue }
+\label{subsec:spsc}
+
+\paragraph{Data structure.}
+The SPSC queue is a record with five fields:
+
+\begin{lstlisting}[caption={Core SPSC record type.}]
+type 'a t = {
+  capacity : int;
+  mask     : int;           (* capacity - 1, for cheap modulo *)
+  buf      : 'a Option.t array;
+  head     : int Atomic.t;  (* consumer writes; producer reads *)
+  tail     : int Atomic.t;  (* producer writes; consumer reads *)
+}
+\end{lstlisting}
+
+Both \texttt{head} and \texttt{tail} are allocated with
+\texttt{Atomic.make\_contended}, which instructs the OCaml runtime to place
+each value on its own cache line.  Without this, the two indices share a line
+and every producer write invalidates the consumer's cached line and vice versa
+--- this is \emph{false sharing}, discussed further in \cref{subsec:false-sharing}.
+
+\paragraph{try\_enqueue.}
+The producer reads \texttt{tail} and \texttt{head}, checks that
+$\texttt{tail} - \texttt{head} < \texttt{capacity}$ (the back-pressure condition),
+writes the value into \texttt{buf[tail \& mask]}, and then performs a
+\emph{release store} on \texttt{tail}. The release ordering guarantees that the
+value write is globally visible before the incremented tail becomes visible
+to the consumer: no explicit fence is required beyond what \texttt{Atomic.set}
+provides in OCaml~5's memory model.
+
+\paragraph{try\_dequeue.}
+Symmetrically, the consumer reads \texttt{head} and \texttt{tail}, returns
+\texttt{None} if $\texttt{head} \geq \texttt{tail}$, reads the value, clears
+the slot for the GC, and release-stores \texttt{head}. No CAS is ever issued:
+the invariant that only one domain writes each index is the key correctness
+property.
+
+\begin{lstlisting}[caption={SPSC enqueue (no CAS required).}]
+let try_enqueue t v =
+  let tl = Atomic.get t.tail in
+  let hd = Atomic.get t.head in
+  if tl - hd >= t.capacity then false
+  else begin
+    t.buf.(tl land t.mask) <- Some v;
+    Atomic.set t.tail (tl + 1); (* release store *)
+    true
+  end
+\end{lstlisting}
+
+\subsection{MPMC Queue : Vyukov's Algorithm}
+\label{subsec:mpmc}
+
+\paragraph{Slot structure.}
+Each element of the ring buffer is not just a value but a \emph{slot} with its
+own sequence number:
+
+\begin{lstlisting}[caption={Per-slot record for Vyukov MPMC.}]
+type 'a slot = {
+  sequence : int Atomic.t;
+  mutable  value : 'a option;
+}
+\end{lstlisting}
+
+The queue-level \texttt{enqueue\_pos} and \texttt{dequeue\_pos} are plain
+\texttt{Atomic.make} values (unpadded in the production implementation);
+the false-sharing investigation in \cref{subsec:false-sharing} quantifies
+the cost of this choice.
+
+\paragraph{Enqueue logic.}
+A producer reads \texttt{enqueue\_pos = pos}, reads \texttt{slot.sequence = seq},
+and computes \texttt{diff = seq - pos}:
+\begin{itemize}[noitemsep]
+  \item \texttt{diff = 0}: the slot is free for this cycle; the producer CAS-es \texttt{enqueue\_pos} from \texttt{pos} to \texttt{pos+1}. If it wins, it writes the value and sets \texttt{slot.sequence = pos+1}, signalling consumers.
+  \item \texttt{diff < 0}: either the buffer is full (consumer has not yet freed this slot for the current cycle) or a consumer is mid-flight; the producer checks \texttt{dequeue\_pos} to distinguish the two cases and either spins or returns \texttt{false}.
+  \item \texttt{diff > 0}: another producer advanced past us; retry.
+\end{itemize}
+
+\paragraph{Dequeue logic.}
+A consumer reads \texttt{dequeue\_pos = pos}, checks \texttt{slot.sequence - (pos+1) = 0}
+(the slot has been written for this cycle), then CAS-es \texttt{dequeue\_pos}. On success
+it reads the value and resets \texttt{slot.sequence = pos + mask + 1}, advancing the sequence
+by one full buffer cycle to free the slot for the next producer wave.
+
+An important subtlety: if \texttt{diff < 0} and \texttt{enqueue\_pos > pos}, a producer has
+claimed the slot via CAS but has not yet written the value. The consumer must spin rather than
+return \texttt{None}, because the enqueue has already logically committed (the producer
+claimed the slot and will return \texttt{true}). Returning \texttt{None} here would violate
+linearisability. The same reasoning applies symmetrically on the producer side.
+
+\subsection{MPSC Queue }
+\label{subsec:mpsc}
+
+The MPSC queue applies Vyukov's per-slot sequence technique but distinguishes the
+consumer path: because there is exactly one consumer, \texttt{dequeue\_pos} is advanced
+with a plain \texttt{Atomic.set} rather than a CAS. This eliminates one atomic
+read-modify-write operation on the hot consumer path.
+
+On the producer side, the spec requires CAS (not FAA) for tail claiming. This is deliberate:
+FAA irrevocably increments the counter, meaning a producer that claims a slot must always
+complete the write, even if the buffer is full. CAS can fail and retry without committing,
+enabling a \emph{non-blocking} \texttt{try\_enqueue} that returns \texttt{false} cleanly
+when the buffer is full rather than spinning indefinitely.
+
+A subtle addition compared to the pure Vyukov MPMC is a ``producer in-flight'' detection
+on the consumer side: if the consumer finds \texttt{diff < 0} but observes that
+\texttt{enqueue\_pos > pos}, it knows a producer has claimed the slot via CAS and must spin
+for the value to appear, rather than incorrectly returning \texttt{None}.
+
+\subsection{Disruptor Pipeline}
+\label{subsec:disruptor}
+
+We implement two pipeline variants:
+\begin{itemize}[noitemsep]
+  \item \textbf{Int\_spsc}: wraps \texttt{disruptor\_sequencer\_spsc} + \texttt{ring\_buffer} + \texttt{sequence\_barrier}.
+  \item \textbf{Int\_mpsc}: wraps \texttt{disruptor\_sequencer\_mpsc} (FAA-based cursor with available-buffer bitmap).
+\end{itemize}
+
+\paragraph{SPSC Sequencer.}
+The producer maintains a \emph{cached consumer sequence} to avoid reading the contended
+consumer atomic on every iteration. Only when the buffer appears full does it refresh
+the cache by reading the live consumer sequence. This single optimisation eliminates a
+cross-domain atomic read on the common (non-full) path.
+
+\paragraph{MPSC Sequencer.}
+The multi-producer sequencer uses \texttt{fetch\_and\_add} on the cursor to claim a
+batch of slots atomically:
+\begin{lstlisting}[caption={FAA-based batch claim in the MPSC Disruptor sequencer.}]
+let next t n =
+  let hi = Sequence.fetch_and_add t.cursor n + n in
+  let lo = hi - n + 1 in
+  ...
+  (lo, hi)
+\end{lstlisting}
+After writing their slots, producers mark each one in \texttt{available\_buffer} so
+that out-of-order publications can be detected by the sequence barrier. A TSAN-flagged
+race on \texttt{cached\_gating\_min} (a mutable field read/written by multiple producer
+domains) was fixed by changing it to an \texttt{Atomic.t}: the cached value is only a
+performance hint, so any recent valid observation is safe regardless of which producer
+writes it last.
+
+\paragraph{Why no Disruptor MPMC.}
+FAA is irrevocable: a consumer that increments \texttt{dequeue\_pos} must complete its
+read. This makes a non-blocking \texttt{try\_dequeue} interface impossible without a
+serialising mutex, which defeats the purpose of FAA-based concurrency.
+Furthermore, clean shutdown in an \texttt{nP:nC} sweep is inherently difficult:
+a consumer that has claimed a slot via FAA but finds no value published (because the
+producer was preempted between its FAA and its \texttt{available\_buffer} write) will
+spin indefinitely. We therefore test Disruptor only in its natural SPSC and MPSC
+pipeline topologies.
+
+\subsection{Supporting Modules}
+
+\texttt{sequence.ml} provides a \texttt{Sequence.t} --- a padded atomic integer
+(\texttt{Atomic.make\_contended}) with get, set, cas, and fetch\_and\_add operations.
+\texttt{sequence\_barrier.ml} implements the consumer-side wait: it polls the sequencer's
+cursor (and, for MPSC, scans the available buffer) to find the highest contiguous
+sequence that can be safely read. \texttt{wait\_strategy.ml} provides the
+\texttt{Domain.cpu\_relax} spinning strategy used throughout.
+
+%==============================================================================
+\section{Testing and Verification}
+\label{sec:testing}
+%==============================================================================
+
+\subsection{Smoke Test}
+
+A hand-written smoke test (\texttt{test\_spsc\_smoke.ml}) verifies basic
+enqueue/dequeue ordering, full-buffer rejection, and empty-queue return values
+for the SPSC queue under sequential execution.
+
+\subsection{Stress Tests}
+
+Three concurrent stress tests verify that no items are lost or duplicated:
+\begin{itemize}[noitemsep]
+  \item \textbf{SPSC stress}: 1\,M items sent from one producer domain to one consumer domain; consumer verifies every item is received exactly once.
+  \item \textbf{MPSC stress}: 4 producers $\times$ 250\,K items; consumer collects all 1\,M items and checks the union.
+  \item \textbf{MPMC stress}: 4 producers $\times$ 4 consumers $\times$ 250\,K items; a shared counter verifies total items consumed.
+\end{itemize}
+All three pass deterministically, confirming no data races on the value path.
+
+\subsection{QCheck-STM and QCheck-Lin }
+
+The most rigorous testing uses \texttt{QCheck-STM} and \texttt{QCheck-Lin} from
+the \texttt{multicoretests} library. We model all three queues against the same
+sequential specification:
+
+\begin{lstlisting}[caption={Sequential model shared by all three STM/Lin test suites.}]
+type state = { contents : int list; capacity : int }
+type cmd   = Enqueue of int | Dequeue
+
+let next_state cmd st = match cmd with
+  | Enqueue v ->
+    if List.length st.contents >= st.capacity then st
+    else { st with contents = st.contents @ [v] }
+  | Dequeue ->
+    (match st.contents with
+     | []     -> st
+     | _ :: t -> { st with contents = t })
+\end{lstlisting}
+
+Because SPSC is inherently single-producer/single-consumer, direct multi-domain
+testing by the STM harness would violate the queue's precondition. We wrap each
+side in a per-side mutex in the test adapter, so the underlying queue code is
+exercised with correct single-writer invariants while the harness can still
+exercise interleaved concurrent command sequences.
+
+Three test categories were run for each of the three queue implementations:
+\begin{enumerate}[noitemsep]
+  \item \textbf{STM sequential} (\texttt{agree\_test}): ensures single-threaded behaviour matches the sequential model.
+  \item \textbf{STM parallel} (\texttt{agree\_test\_par}): generates random parallel command sequences and checks that some sequential interleaving of the observed results is consistent with the model.
+  \item \textbf{Lin linearisability} (\texttt{lin\_test}): independently verifies linearisability using the QCheck-Lin checker.
+\end{enumerate}
+All 9 tests (3 queues $\times$ 3 test types) pass.
+
+\subsection{Comparison Suite }
+
+\texttt{test\_comparison.ml} runs the same STM/Lin battery head-to-head between the
+spec-correct queues and the Disruptor pipeline variants, plus a deterministic replay
+test that enqueues a fixed sequence and checks dequeue order. 11 tests pass across
+SPSC and MPSC design points.
+
+%==============================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+%==============================================================================
+
+\subsection{Experimental Setup}
+
+All benchmarks were run on a multi-core Linux machine with OCaml~5. Each measurement
+runs for 2 seconds with a fixed ring buffer of 65\,536 slots. Throughput is reported
+in millions of operations per second (M\,ops/sec); higher is better. No warm-up
+period is subtracted: the 2-second window is long enough to dominate start-up noise.
+
+\subsection{Thread Sweep }
+\label{subsec:thread-sweep}
+
+\Cref{tab:1p1c,tab:npnc,tab:np1c,tab:1pnc} report throughput across four
+producer/consumer configurations.
+
+\paragraph{1P:1C baseline (\cref{tab:1p1c}).}
+With a single producer and consumer, all implementations are on an even footing:
+there is no contention on either index. The MPSC queue achieves the highest
+throughput (24.62\,M\,ops/sec), which is counterintuitive at first glance. The
+reason is that the MPSC queue uses per-slot sequence numbers (cheaper than
+Option-boxing) and benefits from the fact that its dequeue path needs no CAS. The
+SPSC queue (6.83\,M) is competitive, the Disruptor SPSC (8.56\,M) benefits from its
+cached-consumer optimisation, and the Vyukov MPMC (10.03\,M) beats the Michael-Scott
+queue (6.72\,M) despite its extra sequence-number reads. The mutex-protected bounded
+queue (4.66\,M) is the slowest, as expected.
+
+\begin{table}[H]
+\centering
+\caption{1P:1C throughput (M ops/sec). Single producer, single consumer.}
+\label{tab:1p1c}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Implementation & M ops/sec \\
+\midrule
+MPSC queue (Vyukov)         & 24.62 \\
+Vyukov MPMC                 & 10.03 \\
+Disruptor SPSC              & 8.56  \\
+SPSC queue                  & 6.83  \\
+Michael-Scott               & 6.72  \\
+Disruptor MPSC              & 6.30  \\
+Bounded (mutex)             & 4.66  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{nP:1C (\cref{tab:np1c}).}
+This is the MPSC regime. The Disruptor MPSC dramatically outperforms all others
+at high thread counts, reaching 12.59\,M\,ops/sec at 6 producers. This is the
+key advantage of FAA-based claiming: each producer's claim is unconditional, so
+there is no CAS retry storm. However, the MPSC queue collapses from 25.83\,M
+at 1 producer to 2.00\,M at 5+ producers, suffering from CAS contention. The
+Vyukov MPMC and Michael-Scott queues show similar degradation curves.
+
+\begin{table}[H]
+\centering
+\caption{nP:1C throughput (M ops/sec). n producers, 1 consumer.}
+\label{tab:np1c}
+\begin{tabular}{@{}lccccccccc@{}}
+\toprule
+Impl $\backslash$ n & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+MPSC queue      & 25.83 & 5.23 & 3.25 & 2.38 & 2.00 & 2.00 & 1.91 & 2.00 \\
+Disruptor MPSC  & 7.10  & 7.40 & 9.69 &10.21 &10.10 &12.59 &12.42 &12.54 \\
+Vyukov MPMC     & 7.83  & 3.57 & 2.53 & 2.35 & 2.16 & 1.87 & 1.76 & 1.22 \\
+Michael-Scott   & 5.96  & 3.76 & 2.98 & 2.47 & 2.15 & 2.04 & 1.79 & 1.81 \\
+Bounded(mutex)  & 3.88  & 3.32 & 2.23 & 2.04 & 1.70 & 1.66 & 1.41 & 1.33 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{1P:nC and nP:nC (\cref{tab:1pnc,tab:npnc}).}
+In these configurations only Vyukov MPMC, Michael-Scott, and Bounded(mutex) apply;
+SPSC and MPSC variants are excluded as they do not support multiple consumers. All
+three degrade roughly proportionally with thread count: adding a second consumer
+roughly halves throughput, reflecting the cost of CAS contention on the consumer
+side. Bounded(mutex) is surprisingly competitive in the 1P:nC case: the single
+consumer mutex serialises dequeues, but the fixed cost per operation is low. The
+Vyukov MPMC consistently outperforms Michael-Scott by roughly 1.2$\times$--1.5$\times$
+across these configurations.
+
+\begin{table}[H]
+\centering
+\caption{1P:nC throughput (M ops/sec). 1 producer, n consumers.}
+\label{tab:1pnc}
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule
+Impl $\backslash$ n & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+Vyukov MPMC    & 5.76 & 3.48 & 2.92 & 2.61 & 2.26 & 1.54 & 1.26 & 1.19 \\
+Michael-Scott  & 6.08 & 3.02 & 2.24 & 1.81 & 1.42 & 1.22 & 1.08 & 1.02 \\
+Bounded(mutex) & 4.21 & 3.30 & 3.02 & 2.35 & 2.07 & 1.89 & 1.94 & 1.63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{nP:nC throughput (M ops/sec). n producers, n consumers.}
+\label{tab:npnc}
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule
+Impl $\backslash$ n & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 \\
+\midrule
+Vyukov MPMC    & 6.92 & 2.97 & 1.83 & 1.67 & 1.84 & 1.46 & 1.28 & 1.21 \\
+Michael-Scott  & 5.74 & 2.74 & 1.95 & 1.62 & 1.43 & 1.29 & 1.22 & 1.14 \\
+Bounded(mutex) & 3.87 & 3.67 & 2.28 & 2.19 & 2.06 & 1.77 & 1.69 & 1.58 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Batch-Size Sweep }
+\label{subsec:batch}
+
+\Cref{tab:batch} shows the effect of batch size $k$ on throughput for the 1P:1C configuration.
+
+\begin{table}[H]
+\centering
+\caption{Batch-size sweep — 1P:1C (M ops/sec). Higher $k$ = more items per loop turn.}
+\label{tab:batch}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Impl $\backslash$ batch $k$ & 1 & 4 & 16 & 64 & 256 \\
+\midrule
+Disruptor SPSC  & 6.09 & \textbf{32.04} & 7.30 & 7.31 & 7.71 \\
+Vyukov MPMC     & 6.62 & 8.17  & 7.61 & 8.53 & \textbf{20.71} \\
+Disruptor MPSC  & 6.79 & 6.82  & 6.37 & 6.55 & 6.44 \\
+Michael-Scott   & 5.08 & 2.74  & 4.29 & 5.43 & 6.34 \\
+Bounded(mutex)  & 4.00 & 3.62  & 3.95 & 3.71 & 3.69 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Disruptor SPSC shows a dramatic 5$\times$ boost at $k=4$ (32.04\,M\,ops/sec)
+because the consumer drains all available events per barrier pass, amortising the
+barrier-scan cost across multiple items. The effect diminishes at $k=16$ and beyond
+as the per-item cost re-dominates. The Vyukov MPMC shows a late spike at $k=256$
+(20.71\,M), consistent with its CAS-retry cost being amortised over a large batch.
+The Disruptor MPSC is relatively insensitive to batch size, suggesting its bottleneck
+is the FAA latency rather than per-item overhead.
+
+\subsection{False Sharing }
+\label{subsec:false-sharing}
+
+\Cref{tab:false-sharing} quantifies the throughput impact of cache-line padding
+on atomic indices. Padding is applied via \texttt{Atomic.make\_contended}; the
+unpadded baseline uses \texttt{Atomic.make}.
+
+\begin{table}[H]
+\centering
+\caption{False-sharing investigation. Delta = (padded $-$ unpadded) / unpadded $\times$ 100\%.}
+\label{tab:false-sharing}
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Implementation & Config & Padded (M/s) & Unpadded (M/s) & Delta \\
+\midrule
+Disruptor SPSC & 1P:1C  & 7.20 & 7.36 & $-2.2\%$   \\
+Disruptor MPSC & 1P:1C  & 5.56 & 4.97 & $+11.9\%$  \\
+Disruptor MPSC & 4P:1C  & 8.37 & 1.81 & $+362.7\%$ \\
+Vyukov MPMC    & 1P:1C  & 5.80 & 7.54 & $-23.1\%$  \\
+Vyukov MPMC    & 2P:1C  & 3.83 & 2.73 & $+40.1\%$  \\
+Vyukov MPMC    & 4P:4C  & 2.24 & 1.40 & $+59.9\%$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results reveal two distinct patterns:
+
+\paragraph{Padding helps under contention.} The 362.7\% gain for Disruptor MPSC at 4P:1C
+is the headline result. With 4 producer domains all writing to an \texttt{available\_buffer}
+indexed near the cursor, every cursor write invalidates the cache line shared by
+other producers, causing a cache-coherence storm. Padding the cursor sequence to its own
+line eliminates this entirely.
+
+\paragraph{Padding can hurt in uncontended cases.} Vyukov MPMC at 1P:1C shows a 23.1\%
+\emph{reduction} with padding. When only one producer and one consumer access each index,
+padding spreads them across more cache lines, reducing spatial locality and increasing
+the number of TLB entries consumed. The breakeven point is reached at 2P:1C (+40.1\%
+improvement with padding), where inter-domain false sharing begins to dominate.
+
+\paragraph{Implications for production code.} The SPSC queue uses \texttt{Atomic.make\_contended}
+for both \texttt{head} and \texttt{tail} unconditionally, which is correct: in any realistic
+deployment the producer and consumer run on different cores, and the $-2.2\%$ overhead
+at 1P:1C is negligible compared to the protection afforded. The Vyukov MPMC production
+code uses \texttt{Atomic.make} (unpadded) for its queue-level indices, which is
+suboptimal at higher thread counts; \texttt{make\_contended} should be used for any
+deployment with 2+ producers or 2+ consumers.
+
+%==============================================================================
+\section{Reflection on the Use of LLMs}
+\label{sec:llm}
+%==============================================================================
+
+\paragraph{Tools and models used.}
+We used Claude (Sonnet 4.6) for code generation assistance, debugging, and report drafting.
+GitHub Copilot was used inline within the editor for boilerplate completion. ChatGPT (GPT-4o)
+was consulted for explaining certain aspects of the OCaml 5 memory model and for
+cross-checking our understanding of the Vyukov queue algorithm.
+
+\paragraph{What worked well.}
+Claude was highly effective at generating the QCheck-STM adapter boilerplate, which is
+structurally repetitive across the three queue variants. Given a description of the
+sequential model and the queue interface, it produced a correct \texttt{module SpscAdapter}
+on the first attempt, including the subtle choice to wrap each side in a per-side mutex
+for the test harness without modifying the underlying queue. It also correctly explained
+the slot-lifecycle invariants in Vyukov's algorithm when we described the \texttt{diff}
+cases in informal terms.
+
+\paragraph{What did not work.}
+The LLM initially generated an incorrect \texttt{available\_buffer} indexing formula
+for the MPSC Disruptor sequencer (using \texttt{pos mod size} instead of
+\texttt{(pos lsr index\_shift) land mask}), which produced a subtle bug where
+out-of-order detection failed for large sequence numbers. TSAN did not catch this
+because it is a logical error, not a data race; we caught it by running the STM
+parallel tests which found a failing linearisability trace.
+
+\paragraph{What was surprising.}
+Both positively and negatively: the LLM was better than expected at explaining
+\emph{why} the sequence-barrier spin is necessary (the ``producer in-flight'' case),
+but significantly worse than expected at reasoning about the precise memory ordering
+required. When asked ``does this need a fence?'' it consistently answered with
+hedges like ``it depends on the architecture'' rather than reasoning from OCaml~5's
+defined memory model.
+
+\paragraph{What was difficult.}
+Justifying the linearisation points for the MPSC dequeue ``producer in-flight'' spin
+required genuine understanding of what linearisability means: the linearisation point
+of a successful \texttt{try\_enqueue} is the CAS on \texttt{enqueue\_pos}, not the
+\texttt{Atomic.set slot.sequence} that publishes the value. Once the CAS commits,
+the enqueue is logically complete; any subsequent \texttt{try\_dequeue} at that slot
+must eventually return the value, not \texttt{None}. The LLM could not reason about
+this precisely and kept conflating ``the value is visible'' with ``the operation is
+complete.'' This was the part of the project we had to reason through entirely ourselves.
+
+\paragraph{Overall assessment.}
+The LLM net-helped on scaffolding, boilerplate, and initial drafts, but was unreliable
+on the subtle concurrent-correctness reasoning that constitutes the core intellectual
+contribution of the project. We would use it similarly again, but with more scepticism
+on anything touching memory ordering or linearisation arguments.
+
+%==============================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+%==============================================================================
+
+\paragraph{Answering the research question.}
+A pre-allocated ring buffer gains substantial throughput over the Michael-Scott queue
+in almost every configuration: 1.3$\times$--3.7$\times$ at 1P:1C depending on the
+specific variant. The advantage is largest in the SPSC and MPSC regimes where per-slot
+contention is absent or one-sided. The advantage narrows in the MPMC regime: at 4P:4C,
+the Vyukov MPMC leads the Michael-Scott queue by only $\sim$1.03$\times$ (1.67 vs
+1.62\,M\,ops/sec), because the CAS contention on both ends largely erases the
+allocation savings.
+
+\paragraph{The MPSC$\to$MPMC inflection.}
+The most dramatic complexity-performance inflection occurs precisely at the MPSC$\to$MPMC
+boundary. Moving from MPSC (CAS on tail only) to MPMC (CAS on both tail and head) doubles
+the CAS burden under load. Meanwhile the Disruptor's FAA-based MPSC grows with more producers
+rather than shrinking, reaching 12.59\,M\,ops/sec at 6 producers --- a fundamentally different
+scaling curve that arises because FAA does not involve a retry loop.
+
+\paragraph{False sharing is the dominant micro-architectural effect.}
+The 362\% throughput gain from padding the Disruptor MPSC cursor is the single most
+surprising result. It confirms that for shared-memory concurrent data structures on
+multi-core CPUs, cache-line discipline is not an optional optimisation but a
+correctness-adjacent concern: an unpadded implementation can be 4$\times$ slower
+than the padded one under realistic thread counts.
+
+\paragraph{Limitations and future work.}
+Our benchmarks were conducted on a single machine; results on machines with
+NUMA topology or different cache-line sizes (e.g., Apple Silicon) may differ.
+The Disruptor MPMC was not implemented due to the FAA irrevocability problem;
+a future implementation could use a hybrid approach (FAA with a cancellation
+protocol) to recover non-blocking semantics. It would also be valuable to study
+the queues under realistic workloads with non-trivial item-processing costs,
+where the relative weight of queue overhead vs.\ application work changes the
+optimal design point.
+
+%==============================================================================
+\section*{Contributions}
+%==============================================================================
+
+\begin{center}
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Member} & \textbf{Contribution (\%)} & \textbf{Main responsibilities} \\
+\midrule
+Nishan   & 33\% & SPSC, MPSC implementations; QCheck-Lin/STM tests; stress tests \\
+Chirag   & 34\% & MPMC and Disruptor pipeline; false-sharing benchmark, presentation \\
+Dikshank & 33\% & Thread/batch sweep benchmarks; evaluation analysis; report \\
+\midrule
+\textbf{Total} & \textbf{100\%} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==============================================================================
+\bibliographystyle{plain}
+\bibliography{references}
+%==============================================================================
+
+\end{document}
