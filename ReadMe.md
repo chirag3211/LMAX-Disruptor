@@ -4,6 +4,12 @@
 
 Ring-buffer queues in OCaml 5 — from Lamport SPSC to LMAX Disruptor MPSC — with correctness verification via QCheck-STM/Lin and throughput benchmarking across 1–8 threads.
 
+## Video Recording
+
+```
+https://youtu.be/71tPKnZE--E
+```
+
 ---
 
 ## Table of Contents
